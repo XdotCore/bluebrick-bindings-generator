@@ -3,10 +3,12 @@ mod enum_tokens;
 mod general_tokens;
 mod globals_token;
 
+use itertools::Itertools;
 use proc_macro2::TokenStream;
+use std::collections::VecDeque;
 use std::fmt::Debug;
 
-use crate::generator::{ParseResult, Result, ComputeError, ComputeResult};
+use crate::generator::{ComputeError, ComputeResult, Error, ParseResult, Result, VecResult};
 use crate::parser::{CharRect, Parser};
 use crate::tokens::class_tokens::{ClassToken, FieldsToken, ImplementsToken, OverridesToken, VirtualsToken};
 use crate::tokens::enum_tokens::{EnumToken, EnumTypeToken, EnumValuesToken};
@@ -126,24 +128,41 @@ impl Token for RootToken {
 
 pub struct FileToken {
     pub name: String,
-    pub children: Vec<RootToken>,
+    children: VecDeque<RootToken>,
     char_rect: CharRect,
 }
 
 impl FileToken {
-    pub fn module(&self) -> crate::generator::Result<&ModuleToken> {
-        match self.children.iter().find_map(|child| {
-            match child {
+    pub fn take_module(&mut self) -> Result<ModuleToken> {
+        self.children.pop_front().and_then(|front| {
+            match front {
                 RootToken::Module(module) => Some(module),
-                _ => None,
+                _ => None
             }
-        }) {
-            Some(module) => Ok(module),
-            None => Err(crate::generator::Error {
-                file_name: self.name.clone(),
-                char_rect: self.char_rect(),
-                err: ComputeError::MissingModule { file_name: self.name.clone() }.into(),
-            }),
+        }).ok_or_else(|| Error {
+            file_name: self.name.clone(),
+            char_rect: Default::default(),
+            err: ComputeError::MissingModule { file_name: self.name.clone() }.into(),
+        })
+    }
+
+    pub fn compute_rust(&self) -> VecResult<TokenStream> {
+        let mut compute_errs = Vec::new();
+
+        let result = self.children.iter().filter_map(|child| {
+            match child.to_rust() {
+                Ok(rust) => Some(rust),
+                Err(e) => {
+                    compute_errs.push(e);
+                    None
+                }
+            }
+        }).collect_vec();
+
+        if compute_errs.len() > 0 {
+            Err(compute_errs)
+        } else {
+            Ok(result)
         }
     }
 }
@@ -160,7 +179,7 @@ impl Token for FileToken {
     fn parse(parser: &mut Parser) -> Result<Self> {
         Ok(Self {
             name: parser.file.name.clone(),
-            children: parser.all_tokens()?,
+            children: VecDeque::from(parser.all_tokens()?),
             char_rect: parser.token_char_rect()?,
         })
     }
@@ -170,7 +189,7 @@ impl Token for FileToken {
     }
 
     fn to_rust(&self) -> Result<TokenStream> {
-        unimplemented!("Use children")
+        unimplemented!("Use FileToken::compute_rust instead")
     }
 }
 

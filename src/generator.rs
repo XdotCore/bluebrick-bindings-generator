@@ -1,6 +1,6 @@
 use itertools::Itertools;
 use proc_macro2::TokenStream;
-use std::{ffi::OsStr, fmt::{self, Debug}, fs::{self}, iter, path::{Path, PathBuf}};
+use std::{collections::HashMap, ffi::OsStr, fmt::{self, Debug}, fs::{self}, iter, path::{Path, PathBuf}};
 
 use crate::{logger::Logger, parser::{CharRect, Parser}, tokens::{FileToken, Token}};
 use crate::tokens::RootToken;
@@ -123,57 +123,61 @@ impl Generator {
         }
     }
 
-    fn compute_rust(&self, tokens: Vec<FileToken>) -> (Vec<File>, Vec<Error>) {
+    fn compute_rust(&self, tokens: Vec<FileToken>) -> VecResult<File> {
         let mut compute_errs = Vec::new();
 
-        let files = tokens.iter().chunk_by(|bbfile| bbfile.module()).into_iter().filter_map(|(module, bbfiles)| {
-            let module = match module {
-                Ok(module) => module,
-                Err(e) => {
-                    compute_errs.push(e);
-                    return None;
+        let mut modules = HashMap::new();
+        for mut token in tokens {
+            match token.take_module() {
+                Ok(module) => modules.entry(module).or_insert(Vec::new()).push(token),
+                Err(e) => compute_errs.push(e),
+            }
+        }
+
+        let files = modules.iter().filter_map(|(module, bbfiles)| {
+            let contents = bbfiles.into_iter().filter_map(|bbfile| match bbfile.compute_rust() {
+                Ok(rust) => Some(rust),
+                Err(mut es) => {
+                    compute_errs.append(&mut es);
+                    None
                 }
-            };
+            }).flatten().collect::<TokenStream>().to_string();
 
             Some(File {
                 name: module.name.clone(),
                 path: module.path(),
-                contents: bbfiles.flat_map(|bbfile| {
-                    bbfile.children.iter().filter_map(|child| {
-                        match child.to_rust() {
-                            Ok(rust) => Some(rust.to_string()),
-                            Err(e) => {
-                                compute_errs.push(e);
-                                None
-                            }
-                        }
-                    }).collect_vec()
-                }).collect(),
+                contents,
             })
-        }).collect();
+        }).collect_vec();
 
-        (files, compute_errs)
+        if compute_errs.len() > 0 {
+            Err(compute_errs)
+        } else {
+            Ok(files)
+        }
     }
 
-    fn validate_compute(&self, results: (Vec<File>, Vec<Error>)) -> Result<Vec<File>> {
-        let (results, mut errors) = results;
-        if let Some(last_error) = errors.pop() {
-            let mut result_out = "Got the following errors when computing rust bindings:\n".to_owned();
+    fn validate_compute(&self, results: VecResult<File>) -> Result<Vec<File>> {
+        match results {
+            Ok(results) => {
+                let mut result_out = format!("Computed {} files\n", results.len());
 
-            result_out += &errors.iter().join("\n");
-            result_out += &format!("{}\n", last_error);
+                result_out += &results.iter().map(|file| &file.name).join("\n");
 
-            self.logger.elog("validate_compute", &result_out);
-            
-            Err(last_error)
-        } else {
-            let mut result_out = format!("Computed {} files\n", results.len());
+                self.logger.log("validate_compute", &result_out);
 
-            result_out += &results.iter().map(|file| &file.name).join("\n");
+                Ok(results)
+            }
+            Err(mut errors) => {
+                let mut result_out = "Got the following errors when computing rust bindings:\n".to_owned();
 
-            self.logger.log("validate_compute", &result_out);
+                result_out += &errors.iter().join("\n");
 
-            Ok(results)
+                self.logger.elog("validate_compute", &result_out);
+                
+                // TODO: get rid of this unwrap
+                Err(errors.pop().unwrap())
+            }
         }
     }
 
@@ -250,7 +254,7 @@ pub enum ComputeError {
 impl fmt::Display for ComputeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let string = match self {
-            Self::MissingModule { file_name } => format!("File {file_name} requires a module (e.g. \"mod path::name\")"),
+            Self::MissingModule { file_name } => format!("File {file_name} requires a module (e.g. \"mod path::name\") at the top"),
         };
         write!(f, "{string}")
     }
@@ -299,5 +303,6 @@ impl PartialEq for Error {
 impl std::error::Error for Error {}
 
 pub type Result<T> = std::result::Result<T, Error>;
+pub type VecResult<T> = std::result::Result<Vec<T>, Vec<Error>>;
 pub type ParseResult<T> = std::result::Result<T, ParseError>;
 pub type ComputeResult<T> = std::result::Result<T, ComputeError>;

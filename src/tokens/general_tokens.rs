@@ -1,13 +1,16 @@
 use std::fmt::{self, Debug, Display};
+use std::hash::Hash;
 
 use itertools::Itertools;
-use proc_macro2::TokenStream;
+use proc_macro2::{Span, TokenStream};
+use quote::quote;
+use syn::{Ident, ItemUse};
 
 use crate::generator::{ParseError, ParseResult, Result};
 use crate::{parser::{CharRect, Parser}};
 use crate::tokens::{FromWord, Token};
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Hash)]
 pub struct NameToken {
     name: String,
     char_rect: CharRect,
@@ -44,7 +47,7 @@ impl Token for NameToken {
     }
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Hash)]
 pub struct ModuleToken {
     pub name: String,
     parents: ListToken<NameToken>,
@@ -62,6 +65,8 @@ impl Debug for ModuleToken {
         write!(f, "{}", self.path())
     }
 }
+
+impl Eq for ModuleToken {}
 
 impl Token for ModuleToken {
     fn token_type() -> &'static str { "Module" }
@@ -82,7 +87,13 @@ impl Token for ModuleToken {
     }
     
     fn to_rust(&self) -> Result<TokenStream> {
-        todo!("Implement ModuleToken to_rust")
+        let mut modules = self.parents.items.iter().map(|p| p.name.as_str()).collect_vec();
+        modules.push(self.name.as_str());
+        let modules = modules.into_iter().map(|m| Ident::new(&m, Span::call_site()));
+
+        Ok(quote! {
+            use #(#modules)::*;
+        })
     }
 }
 
@@ -106,6 +117,12 @@ impl<T: PartialEq> PartialEq for ListToken<T> {
             }
         }
         return true;
+    }
+}
+
+impl<T: Hash> Hash for ListToken<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.items.hash(state);
     }
 }
 
