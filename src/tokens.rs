@@ -6,7 +6,7 @@ mod globals_token;
 use proc_macro2::TokenStream;
 use std::fmt::Debug;
 
-use crate::generator::{ParseResult, Result, ValidateError, ValidateResult};
+use crate::generator::{ParseResult, Result, ComputeError, ComputeResult};
 use crate::parser::{CharRect, Parser};
 use crate::tokens::class_tokens::{ClassToken, FieldsToken, ImplementsToken, OverridesToken, VirtualsToken};
 use crate::tokens::enum_tokens::{EnumToken, EnumTypeToken, EnumValuesToken};
@@ -142,7 +142,7 @@ impl FileToken {
             None => Err(crate::generator::Error {
                 file_name: self.name.clone(),
                 char_rect: self.char_rect(),
-                err: ValidateError::MissingModule { file_name: self.name.clone() }.into(),
+                err: ComputeError::MissingModule { file_name: self.name.clone() }.into(),
             }),
         }
     }

@@ -3,20 +3,20 @@ use std::{any::type_name, collections::VecDeque, fmt::{self, Debug}, path::Path,
 use itertools::Itertools;
 use num_traits::Num;
 
-use crate::generator::{BBFile, Error, ParseError, ParseResult, Result};
+use crate::generator::{File, Error, ParseError, ParseResult, Result};
 use crate::logger::Logger;
 use crate::tokens::{FromWord, Token};
 
 pub struct Parser<'a> {
     logger: &'a Logger,
-    pub file: BBFile,
+    pub file: File,
     basic_tokens: VecDeque<BasicToken>,
     used_basic_tokens: Vec<Vec<BasicToken>>,
     token_depth: usize,
 }
 
 impl<'a> Parser<'a> {
-    pub fn new(file: BBFile, logger: &'a Logger) -> Self {
+    pub fn new(file: File, logger: &'a Logger) -> Self {
         logger.log(&file.path, &format!("file: {}.bb", file.name));
 
         let basic_tokens = Self::split_to_basics(&file).into();
@@ -37,7 +37,7 @@ impl<'a> Parser<'a> {
 
     // TODO: this deserves a rewrite eventually
     // TODO: add markdown comments for docs generation
-    fn split_to_basics(file: &BBFile) -> Vec<BasicToken> {
+    fn split_to_basics(file: &File) -> Vec<BasicToken> {
         let chars = file.contents.chars().collect_vec();
         let mut column = 1;
         let mut line = 1;
