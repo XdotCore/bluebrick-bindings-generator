@@ -1,514 +1,1160 @@
-use std::{any::type_name, collections::VecDeque, fmt::{self, Debug}, path::Path, str::FromStr};
+use std::{fs, path::Path};
 
-use itertools::Itertools;
-use num_traits::Num;
+use pest::{Parser, iterators::{Pair, Pairs}};
+use pest_derive::Parser;
+use walkdir::WalkDir;
 
-use crate::generator::{File, Error, ParseError, ParseResult, Result};
-use crate::logger::Logger;
-use crate::tokens::{FromWord, Token};
+use crate::ast::*;
+use crate::error::Error;
+use crate::result::Result;
 
-pub struct Parser<'a> {
-    logger: &'a Logger,
-    pub file: File,
-    basic_tokens: VecDeque<BasicToken>,
-    used_basic_tokens: Vec<Vec<BasicToken>>,
-    token_depth: usize,
+#[derive(Parser)]
+#[grammar = "grammar.pest"]
+pub struct BBBParser;
+
+pub fn parse(root: &Path) -> std::result::Result<Vec<File>, String> {
+    WalkDir::new(root).into_iter().filter_map(|entry| {
+        let entry = entry.ok()?;
+        let path = entry.path();
+
+        let ext = path.extension()?.to_str()?;
+        if ext != "bb" {
+            return None;
+        }
+        
+        let name = path.file_stem()?.to_string_lossy().to_string();
+        let contents = fs::read_to_string(path).ok()?;
+        let path = path.strip_prefix(root).ok()?.to_owned();
+        
+        Some((path, name, contents))
+    }).map(|(path, name, contents)| {
+        println!("{}", path.display());
+
+        let mut ctx = Ctx::new(path.to_string_lossy().to_string());
+        parse_file(&mut ctx, name, contents)
+            .map_err(|_| ctx.to_string())
+    }).collect()
 }
 
-impl<'a> Parser<'a> {
-    pub fn new(file: File, logger: &'a Logger) -> Self {
-        logger.log(&file.path, &format!("file: {}.bb", file.name));
-
-        let basic_tokens = Self::split_to_basics(&file).into();
-        logger.log(&file.path, &format!("\nBasics: {basic_tokens:#?}\n"));
-        
-        Self {
-            logger,
-            file,
-            basic_tokens,
-            used_basic_tokens: Vec::new(),
-            token_depth: 0,
+fn parse_file(ctx: &mut Ctx, name: String, source: String) -> Result<File> {
+    let pairs = match BBBParser::parse(Rule::File, &source) {
+        Ok(pairs) => pairs,
+        Err(e) => {
+            let line_col = e.line_col.clone();
+            ctx.add_err(Error::PestError(e), ctx.span_from_linecol(line_col));
+            return Err(());
         }
-    }
+    };
 
-    const RESERVED_CHARS: [char; 13] = [ '/', '*', ':', '=', ',', '[', ']', '{', '}', '(', ')', '<', '>' ];
-    // must be sorted by length so that longer words are checked first
-    const RESERVED_WORDS: [&'static str; 15] = [ "//", "/*", "*/", "::", ":", "=", ",", "[", "]", "{", "}", "(", ")", "<", ">" ];
+    let module = parse_required_tag::<ModExpr>(ctx, &pairs,
+        "mod", Error::MissingModule, &ctx.span_at_start())
+        .map(|expr| expr.module);
 
-    // TODO: this deserves a rewrite eventually
-    // TODO: add markdown comments for docs generation
-    fn split_to_basics(file: &File) -> Vec<BasicToken> {
-        let chars = file.contents.chars().collect_vec();
-        let mut column = 1;
-        let mut line = 1;
-        let mut basics = Vec::new();
-        
-        let mut i = 0;
-        while i < chars.len() {
-            match chars[i] {
-                '\n' => { // newline
-                    column = 1;
-                    line += 1;
-                }
-                c if c.is_whitespace() => { // whitespace
-                    column += 1;
-                }
-                c if Self::RESERVED_CHARS.contains(&c) => { // reserved word
-                    let begin = (line, column);
-                    
-                    let mut found_word = None;
-                    for word in Self::RESERVED_WORDS.iter().map(|w| w.chars().collect_vec()) {
-                        let word_end = i + word.len();
-                        if word_end < chars.len() {
-                            let check = &chars[i..word_end];
-                            if word == check {
-                                found_word = Some(word);
-                                break;
-                            }
-                        }
-                    }
+    let usings = parse_required_tag::<Vec<UseExpr>>(ctx, &pairs,
+        "uses", Error::MissingUses,
+        &match module.as_ref() {
+            Ok(module) => module.span.after_end(),
+            Err(_) => ctx.span_at_start(),
+        })
+        .map(|vec| vec.into_iter().map(|expr| expr.module).collect::<Vec<_>>());
 
-                    if let Some(word) = found_word {
-                        match word.into_iter().collect::<String>().as_str() {
-                            "//" => {
-                                i += 2;
-                                column += 2;
-                                let mut comment = "//".to_owned();
+    let blocks = parse_required_tag::<Vec<_>>(ctx, &pairs,
+        "top_blocks", Error::MissingTopLevelBlocks,
+        &match usings.as_ref().ok().and_then(|vec| vec.last()) {
+            Some(last_using) => last_using.span.after_end(),
+            None => ctx.span_at_start(),
+        });
 
-                                while i < chars.len() {
-                                    match chars[i] {
-                                        '\n' => {
-                                            i -= 1;
-                                            break;
-                                        }
-                                        '\r' => {
-                                            column += 1;
-                                        }
-                                        c => {
-                                            comment.push(c);
-                                            column += 1;
-                                        }
-                                    }
-                                    i += 1;
-                                }
+    let mut classes = Vec::new();
+    let mut enums = Vec::new();
+    let mut global_variables = Vec::new();
+    let mut global_functions = Vec::new();
 
-                                let end = (line, column - 1);
+    let mut had_error = false;
+    for block in blocks? {
+        let Ok(relation_block) = RelationBlock::parse(ctx, block) else {
+            had_error = true;
+            continue;
+        };
 
-                                basics.push(BasicToken {
-                                    variant: BasicTokenVariant::Comment(comment),
-                                    char_rect: CharRect::from((begin, end)),
-                                });
-                            }
-                            "/*" => {
-                                i += 2;
-                                column += 2;
-                                let mut comment = "/*".to_owned();
-
-                                while i < chars.len() {
-                                    match chars[i] {
-                                        '*' if i + 1 < chars.len() && chars[i + 1] == '/' => {
-                                            i += 1;
-                                            column += 2;
-                                            break;
-                                        }
-                                        '\n' => {
-                                            column = 0;
-                                            line += 1;
-                                            comment.push('\n');
-                                        }
-                                        c => {
-                                            column += 1;
-                                            comment.push(c);
-                                        }
-                                    }
-                                    i += 1;
-                                }
-
-                                let end = (line, column - 1);
-
-                                basics.push(BasicToken {
-                                    variant: BasicTokenVariant::Comment(comment),
-                                    char_rect: CharRect::from((begin, end)),
-                                });
-                            }
-                            word => {
-                                let word = word.to_owned();
-                                column += word.len();
-                                i += word.len() - 1;
-
-                                let end = (line, column - 1);
-
-                                basics.push(BasicToken {
-                                    variant: BasicTokenVariant::Reserved(word),
-                                    char_rect: CharRect::from((begin, end)),
-                                });
-                            }
-                        }
-                    } else {
-                        let reserved = chars[i].to_string();
-                        column += 1;
-
-                        basics.push(BasicToken {
-                            variant: BasicTokenVariant::Reserved(reserved),
-                            char_rect: CharRect::from((begin, begin)),
-                        })
-                    }
-                }
-                c => { // word
-                    let begin = (line, column);
-                    let mut word = c.to_string();
-                    column += 1;
-                    i += 1;
-
-                    while i < chars.len() {
-                        match chars[i] {
-                            c if c.is_whitespace() || Self::RESERVED_CHARS.contains(&c) => {
-                                i -= 1; // ignore and end word
-                                break;
-                            }
-                            c => {
-                                word.push(c);
-                                column += 1;
-                            }
-                        }
-                        i += 1;
-                    }
-
-                    let end = (line, column - 1);
-
-                    if word.len() > 0 {
-                        basics.push(BasicToken {
-                            variant: BasicTokenVariant::Word(word.clone()),
-                            char_rect: CharRect::from((begin, end)),
-                        });
-                    }
-                }
+        had_error |= match relation_block.kind.as_str() {
+            "class" => Class::parse(ctx, relation_block)
+                .map(|class| classes.push(class)),
+            "enum" => Enum::parse(ctx, relation_block)
+                .map(|r#enum| enums.push(r#enum)),
+            "globals" => Globals::parse(ctx, relation_block)
+                .map(|Globals { variables, functions }| {
+                    global_variables.extend(variables);
+                    global_functions.extend(functions);
+                }),
+            kind => {
+                ctx.add_err(Error::UnexpectedTopLevelBlock { kind: kind.to_owned() }, relation_block.kind.span);
+                Err(())
             }
-            i += 1;
-        }
-
-        basics
+        }.is_err();
+    }
+    if had_error {
+        return Err(());
     }
 
-    fn make_error_impl(&self, char_rect: CharRect, err: ParseError) -> Error {
-        Error {
-            file_name: self.file.path.clone(),
-            char_rect,
-            err: err.into(),
-        }
-    }
-    
-    fn make_error_with_basic(&self, basic: &BasicToken, err: ParseError) -> Error {
-        self.make_error_impl(basic.char_rect, err)
-    }
+    let module = module?;
+    let usings = usings?;
 
-    pub fn make_error(&self, err: ParseError) -> Error {
-        if let Some(last) = self.last_used_basic_token() {
-            self.make_error_with_basic(last, err)
-        } else {
-            self.make_error_impl(Default::default(), ParseError::NoLastUsedBasic)
-        }
-    }
+    Ok(File {
+        name,
+        module,
+        usings,
+        classes,
+        enums,
+        global_variables,
+        global_functions,
+    })
+}
 
-    fn make_eof_error(&self, err: ParseError) -> Error {
-        self.make_error_impl(Default::default(), err)
-    }
-
-    fn token_tabs_by_depth(&self) -> String {
-        let token_depth = self.token_depth;
-        let token_depth = token_depth.checked_sub(1).unwrap_or(0);
-        let token_depth = "\t".repeat(token_depth);
-        token_depth
-    }
-
-    fn start_token<T: Token>(&mut self) {
-        self.token_depth += 1;
-        self.used_basic_tokens.push(Vec::new());
+impl<'a> Parsable<'a> for WithSpan<usize> {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        let span = ctx.span_from_pair(&pair);
+        let string = pair.as_str();
         
-        let depth = self.token_tabs_by_depth();
-        let type_name = T::token_type();
-        self.logger.log(&self.file.path, &format!("{depth}Starting {type_name} token"));
-    }
-
-    fn end_token<T: Token>(&mut self) {
-        let depth = self.token_tabs_by_depth();
-        let type_name = type_name::<T>();
-        self.logger.log(&self.file.path, &format!("{depth}Ending {type_name} token"));
-
-        if let Some(mut basics_used) = self.used_basic_tokens.pop() &&
-           let Some(parent_basics_used) = self.used_basic_tokens.last_mut() {
-            parent_basics_used.append(&mut basics_used);
-        }
-        self.token_depth -= 1;
-    }
-
-    fn log_token<T: Token>(&self, token: &T) {
-        let depth = self.token_tabs_by_depth();
-        let char_rect = token.char_rect();
-        self.logger.log(&self.file.path, &format!("{depth}{token:?}, {char_rect}"));
-    }
-
-    pub fn token<T: Token>(&mut self) -> Result<T> {
-        self.token_from_ctor(&T::parse)
-    }
-
-    pub fn token_from_ctor<T: Token>(&mut self, ctor: &impl Fn(&mut Self) -> Result<T>) -> Result<T> {
-        self.start_token::<T>();
-        let token = ctor(self)?;
-        self.log_token(&token);
-        self.end_token::<T>();
-        Ok(token)
-    }
-
-    pub fn token_char_rect(&self) -> Result<CharRect> {
-        if let Some(basics_used) = self.used_basic_tokens.last() {
-            let start = basics_used.iter().map(|b| b.char_rect.start()).min().unwrap_or_default();
-            let end = basics_used.iter().map(|b| b.char_rect.end()).max().unwrap_or_default();
-            Ok(CharRect::from((start, end)))
+        let value = if let Some(string) = string.strip_prefix("0b") {
+            usize::from_str_radix(string, 2)
+        } else if let Some(string) = string.strip_prefix("0o") {
+            usize::from_str_radix(string, 8)
+        } else if let Some(string) = string.strip_prefix("0x") {
+            usize::from_str_radix(string, 16)
         } else {
-            Err(self.make_error(ParseError::RanOutOfUsedBasics))
-        }
-    }
+            string.parse()
+        }.map_err(|e| {
+            ctx.add_err(Error::ParseInt(e), span.clone());
+        })?;
 
-    pub fn all_tokens<T: Token>(&mut self) -> Result<Vec<T>> {
-        let mut tokens = Vec::new();
-
-        while self.basic_tokens.iter().filter(|b| !matches!(b.variant, BasicTokenVariant::Comment(_))).count() > 0 {
-            tokens.push(T::parse(self)?);
-        }
-
-        Ok(tokens)
-    }
-
-    fn use_basic(&mut self, basic: BasicToken) -> Result<()> {
-        if let Some(basics_used) = self.used_basic_tokens.last_mut() {
-            basics_used.push(basic);
-            Ok(())
-        } else {
-            Err(self.make_error(ParseError::RanOutOfUsedBasics))
-        }
-    }
-
-    fn last_used_basic_token(&self) -> Option<&BasicToken> {
-        self.used_basic_tokens.iter().flatten().rev().find(|basic| {
-            match basic.variant {
-                BasicTokenVariant::Comment(_) => {
-                    false // ignore
-                }
-                _ => true
-            }
+        Ok(WithSpan {
+            value,
+            span,
         })
     }
+}
 
-    pub fn take_word(&mut self) -> Result<String> {
-        while let Some(basic) = self.basic_tokens.pop_front() {
-            match basic.variant.clone() {
-                BasicTokenVariant::Comment(_) => {
-                    self.use_basic(basic);
-                }
-                BasicTokenVariant::Reserved(reserved) => {
-                    return Err(self.make_error_with_basic(&basic, ParseError::WantWordGotReserved(reserved)));
-                }
-                BasicTokenVariant::Word(word) => {
-                    self.use_basic(basic);
-                    return Ok(word);
-                }
+impl<'a> Parsable<'a> for WithSpan<String> {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        Ok(WithSpan {
+            span: ctx.span_from_pair(&pair),
+            value: pair.as_str().to_owned(),
+        })
+    }
+}
+
+impl<'a> Parsable<'a> for Module {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        Ok(Module {
+            span: ctx.span_from_pair(&pair),
+            names: parse_all_as(ctx, pair.into_inner())?,
+        })
+    }
+}
+
+impl<'a> Parsable<'a> for Type {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        let span = ctx.span_from_pair(&pair);
+        let pair = match pair.into_inner().next() {
+            Some(pair) => pair,
+            None => {
+                ctx.add_err(Error::Unexpected("Found type with no inner pair.".to_owned()), span);
+                return Err(());
             }
-        }
-
-        Err(self.make_eof_error(ParseError::WantWordGotEOF()))
-    }
-
-    pub fn peek_word(&self) -> Option<String> {
-        match self.basic_tokens.front() {
-            Some(front) => {
-                match front.variant.clone() {
-                    BasicTokenVariant::Word(word) => Some(word),
-                    _ => None,
-                }
-            }
-            None => None
-        }
-    }
-
-    pub fn take_reserved(&mut self) -> Result<String> {
-        while let Some(basic) = self.basic_tokens.pop_front() {
-            match basic.variant.clone() {
-                BasicTokenVariant::Comment(_) => {
-                    self.use_basic(basic);
-                }
-                BasicTokenVariant::Reserved(reserved) => {
-                    self.use_basic(basic);
-                    return Ok(reserved);
-                }
-                BasicTokenVariant::Word(word) => {
-                    return Err(self.make_error_with_basic(&basic, ParseError::WantReservedGotWord(word)));
-                }
-            }
-        }
-
-        Err(self.make_eof_error(ParseError::WantReservedGotEOF()))
-    }
-
-    pub fn peek_reserved(&self) -> Option<String> {
-        match self.basic_tokens.front() {
-            Some(front) => {
-                match front.variant.clone() {
-                    BasicTokenVariant::Reserved(reserved) => Some(reserved),
-                    _ => None,
-                }
-            }
-            None => None
-        }
-    }
-
-    pub fn drop_word(&mut self) -> Result<()> {
-        self.take_word().map(|_| ())
-    }
-
-    pub fn if_word<T>(&mut self, word: &str, action: &impl Fn(&mut Self) -> Result<T>) -> Result<Option<T>> {
-        if Some(word) == self.peek_word().as_ref().map(|s| s.as_str()) {
-            self.drop_word()?;
-            action(self).map(|r| Some(r))
-        } else {
-            Ok(None)
-        }
-    }
-
-    pub fn drop_reserved(&mut self) -> Result<()> {
-        self.take_reserved().map(|_| ())
-    }
-
-    pub fn if_reserved<T>(&mut self, reserved: &str, action: &impl Fn(&mut Self) -> Result<T>) -> Result<Option<T>> {
-        if !Self::is_reserved(reserved) {
-            Err(self.make_error(ParseError::NotAReserved(reserved.to_owned())))?;
-        }
-
-        if Some(reserved) == self.peek_reserved().as_deref() {
-            action(self).map(|r| Some(r))
-        } else {
-            Ok(None)
-        }
-    }
-
-    pub fn from_word<T: FromWord>(&mut self) -> Result<T> {
-        T::from_word(self.take_word()?.as_str()).map_err(|e| self.make_error(e))
-    }
-
-    pub fn expect_word(&mut self, options: &[&str]) -> Result<String> {
-        let options = options.iter().map(|o| (*o).to_owned()).collect_vec();
-        let word = self.take_word()?;
-
-        if options.contains(&word) {
-            Ok(word)
-        } else {
-            Err(self.make_error(ParseError::UnexpectedWord { word, options }))
-        }
-    }
-
-    fn is_reserved(reserved: &str) -> bool {
-        Self::RESERVED_WORDS.contains(&reserved)
-    }
-
-    pub fn expect_reserved<'i, I>(&mut self, options: I) -> Result<String> where I: IntoIterator<Item = &'i str> {
-        let options = options.into_iter().collect_vec();
-
-        if let Some(not_reserved) = options.iter().find(|c| !Self::is_reserved(c)).copied() {
-            return Err(self.make_error(ParseError::NotAReserved(not_reserved.to_owned())));
-        }
-
-        let reserved = self.take_reserved()?;
-
-        if options.contains(&reserved.as_str()) {
-            Ok(reserved)
-        } else {
-            Err(self.make_error(ParseError::UnexpectedReserved {
-                reserved,
-                options: options.iter().map(|o| (*o).to_owned()).collect()
-            }))
-        }
-    }
-
-    pub fn expect_num<T: Num + FromStr>(&mut self) -> Result<T>
-    where
-        T::FromStrRadixErr: std::error::Error + 'static,
-        T::Err: std::error::Error + 'static,
-    {
-        let num = self.take_word()?;
-        let (radix, num) = match num.split_at_checked(2) {
-            Some((prefix, value)) => {
-                match prefix {
-                    "0b" => (2, value),
-                    "0o" => (8, value),
-                    "0x" => (16, value),
-                    _ => (10, num.as_str()),
-                }
-            }
-            None => (10, num.as_str())
         };
-        T::from_str_radix(num, radix).map_err(|e| self.make_error(ParseError::InvalidNumber {
-            word: num.to_owned(),
-            num_type: type_name::<T>().to_owned(),
-            e: Box::new(e),
-        }))
-    }
-}
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CharRect {
-    start_line: usize,
-    start_column: usize,
-    end_line: usize,
-    end_column: usize,
-}
-
-impl CharRect {
-    fn start(&self) -> (usize, usize) {
-        (self.start_line, self.start_column)
-    }
-
-    fn end(&self) -> (usize, usize) {
-        (self.end_line, self.end_column)
-    }
-}
-
-impl fmt::Display for CharRect {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "from {}, {}, to {}, {}", self.start_line, self.start_column, self.end_line, self.end_column)
-    }
-}
-
-impl From<((usize, usize), (usize, usize))> for CharRect {
-    fn from(value: ((usize, usize), (usize, usize))) -> Self {
-        let ((start_line, start_column), (end_line, end_column)) = value;
-        CharRect {
-            start_line,
-            start_column,
-            end_line,
-            end_column,
+        match pair.as_rule() {
+            Rule::ArrayType => ArrayType::parse(ctx, pair)
+                .map(|arr| Type::Array(arr)),
+            Rule::PointerType => PointerType::parse(ctx, pair)
+                .map(|ptr| Type::Pointer(ptr)),
+            Rule::FunctionType => FunctionType::parse(ctx, pair)
+                .map(|r#fn| Type::Function(r#fn)),
+            Rule::NamedType => NamedType::parse(ctx, pair)
+                .map(|named| Type::Named(named)),
+            _ => {
+                ctx.add_err(Error::Unexpected("Found type with unknown inner pair.".to_owned()), span);
+                Err(())
+            }
         }
     }
 }
 
-impl From<(CharRect, CharRect)> for CharRect {
-    fn from(value: (CharRect, CharRect)) -> Self {
-        let (a, b) = value;
-        let start = a.start().min(b.start());
-        let end = a.end().max(b.end());
-        
-        Self::from((start, end))
+impl<'a> Parsable<'a> for ArrayType {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        let span = ctx.span_from_pair(&pair);
+        let inner = pair.into_inner();
+
+        let count = parse_required_tag(ctx, &inner,
+            "count", Error::Unexpected("Found array type with no count.".to_owned()), &span);
+        let item_type = parse_required_tag(ctx, &inner,
+            "type", Error::Unexpected("Found array type with no item type.".to_owned()), &span);
+
+        let count = count?;
+        let item_type = Box::new(item_type?);
+
+        Ok(ArrayType {
+            count,
+            item_type,
+            span,
+        })
     }
 }
 
-#[derive(Debug, Clone)]
-struct BasicToken {
-    variant: BasicTokenVariant,
-    char_rect: CharRect,
+impl<'a> Parsable<'a> for PointerType {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        let span = ctx.span_from_pair(&pair);
+        let inner = pair.into_inner();
+
+        let inner_type = parse_required_tag(ctx, &inner,
+            "type", Error::Unexpected("Found pointer type with no inner type.".to_owned()), &span);
+
+        let inner_type = Box::new(inner_type?);
+
+        Ok(PointerType {
+            inner_type,
+            span,
+        })
+    }
 }
 
-#[derive(Debug, Clone)]
-enum BasicTokenVariant {
-    Word(String),
-    Reserved(String),
-    Comment(String),
+impl<'a> Parsable<'a> for FunctionType {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        let span = ctx.span_from_pair(&pair);
+        let inner = pair.into_inner();
+
+        let call_conv = parse_required_tag(ctx, &inner,
+            "callconv", Error::Unexpected("Found function type without call conv.".to_owned()), &span);
+        let generics = parse_required_tag(ctx, &inner,
+            "generics", Error::Unexpected("Found function type without generics.".to_owned()), &span);
+        let args = parse_required_tag(ctx, &inner,
+            "args", Error::Unexpected("Found function type without args.".to_owned()), &span);
+        let ret = parse_required_tag(ctx, &inner,
+            "ret", Error::Unexpected("Found function type without ret.".to_owned()), &span);
+            
+        let FunctionCallConv { call_conv } = call_conv?;
+        let FunctionGenerics { generics } = generics?;
+        let args = args?;
+        let FunctionRet { ret } = ret?;
+
+        Ok(FunctionType {
+            call_conv,
+            generics,
+            args,
+            ret,
+            span,
+        })
+    }
+}
+
+struct FunctionCallConv {
+    pub call_conv: Option<WithSpan<String>>,
+}
+
+impl<'a> Parsable<'a> for FunctionCallConv {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        let inner = pair.into_inner();
+
+        let call_conv = parse_optional_tag(ctx, &inner, 
+            "name");
+
+        let call_conv = call_conv?;
+
+        Ok(Self {
+            call_conv,
+        })
+    }
+}
+
+struct FunctionGenerics {
+    pub generics: Option<GenericParams>,
+}
+
+impl<'a> Parsable<'a> for FunctionGenerics {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        let inner = pair.into_inner();
+
+        let generics = parse_optional_tag(ctx, &inner, 
+            "generics");
+
+        let generics = generics?;
+
+        Ok(Self {
+            generics,
+        })
+    }
+}
+
+impl<'a> Parsable<'a> for FunctionArg {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        let span = ctx.span_from_pair(&pair);
+        let inner = pair.into_inner();
+
+        let name = parse_required_tag(ctx, &inner,
+            "name", Error::Unexpected("Found function arg without name.".to_owned()), &span);
+        let r#type = parse_required_tag(ctx, &inner,
+            "type", Error::Unexpected("Found function arg without type.".to_owned()), &span);
+
+        let name = name?;
+        let r#type = r#type?;
+
+        Ok(FunctionArg {
+            name,
+            r#type,
+            span,
+        })
+    }
+}
+
+struct FunctionRet {
+    pub ret: Option<Box<Type>>,
+}
+
+impl<'a> Parsable<'a> for FunctionRet {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        let inner = pair.into_inner();
+
+        let ret = parse_optional_tag(ctx, &inner, 
+            "type");
+
+        let ret = ret?.map(Box::new);
+
+        Ok(Self {
+            ret,
+        })
+    }
+}
+
+impl<'a> Parsable<'a> for NamedType {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        let span = ctx.span_from_pair(&pair);
+        let inner = pair.into_inner();
+
+        let name = parse_required_tag(ctx, &inner,
+            "name", Error::Unexpected("Found named type without name.".to_owned()), &span);
+        let generics = parse_optional_tag(ctx, &inner,
+            "generics");
+
+        let name = name?;
+        let generics = generics?;
+
+        Ok(NamedType {
+            name,
+            generics,
+            span,
+        })
+    }
+}
+
+struct Binding {
+    pub name: WithSpan<String>,
+    pub r#type: Type,
+}
+
+impl<'a> Parsable<'a> for Binding {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        let span = ctx.span_from_pair(&pair);
+        let inner = pair.into_inner();
+
+        let name = parse_required_tag(ctx, &inner,
+            "name", Error::Unexpected("Found binding without name.".to_owned()), &span);
+        let r#type = parse_required_tag(ctx, &inner,
+            "type", Error::Unexpected("Found binding without type.".to_owned()), &span);
+
+        let name = name?;
+        let r#type = r#type?;
+
+        Ok(Binding {
+            name,
+            r#type,
+        })
+    }
+}
+
+impl<'a> Parsable<'a> for GenericParams {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        Ok(GenericParams {
+            span: ctx.span_from_pair(&pair),
+            names: parse_all_as(ctx, pair.into_inner())?
+        })
+    }
+}
+
+impl<'a> Parsable<'a> for GenericArgs {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        Ok(GenericArgs {
+            span: ctx.span_from_pair(&pair),
+            types: parse_all_as(ctx, pair.into_inner())?
+        })
+    }
+}
+
+struct TypedBlock<'a> {
+    pub r#type: Type,
+    pub block: Pair<'a, Rule>,
+}
+
+impl<'a> Parsable<'a> for TypedBlock<'a> {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        let span = ctx.span_from_pair(&pair);
+        let inner = pair.into_inner();
+
+        let r#type = parse_required_tag(ctx, &inner,
+            "type", Error::Unexpected("Found typed block without type.".to_owned()), &span);
+        let block = parse_required_tag(ctx, &inner,
+            "block", Error::Unexpected("Found typed block without block.".to_owned()), &span);
+
+        let r#type = r#type?;
+        let block = block?;
+
+        Ok(TypedBlock {
+            r#type,
+            block,
+        })
+    }
+}
+
+struct ModExpr {
+    pub module: Module,
+}
+
+impl<'a> Parsable<'a> for ModExpr {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        let span = ctx.span_from_pair(&pair);
+        let inner = pair.into_inner();
+
+        let module = parse_required_tag(ctx, &inner, 
+            "module", Error::Unexpected("Found mod expr without a module.".to_owned()), &span);
+
+        let module = module?;
+
+        Ok(ModExpr {
+            module,
+        })
+    }
+}
+
+struct UseExpr {
+    pub module: Module,
+}
+
+impl<'a> Parsable<'a> for UseExpr {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        let span = ctx.span_from_pair(&pair);
+        let inner = pair.into_inner();
+
+        let module = parse_required_tag(ctx, &inner, 
+            "module", Error::Unexpected("Found mod expr without a module.".to_owned()), &span);
+
+        let module = module?;
+
+        Ok(UseExpr {
+            module,
+        })
+    }
+}
+
+struct Relation<'a> {
+    pub left: Pair<'a, Rule>,
+    pub right: Pair<'a, Rule>,
+}
+
+impl<'a> Parsable<'a> for Relation<'a> {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        let span = ctx.span_from_pair(&pair);
+        let inner = pair.into_inner();
+
+        let left = parse_required_tag(ctx, &inner,
+            "left", Error::Unexpected("Found relation with no left side.".to_owned()), &span);
+        let right = parse_required_tag(ctx, &inner,
+            "right", Error::Unexpected("Found relation with no right side.".to_owned()), &span);
+
+        let left = left?;
+        let right = right?;
+
+        Ok(Self {
+            left,
+            right,
+        })
+    }
+}
+
+impl<'a> Relation<'a> {
+    pub fn parse_into<L: Parsable<'a>, R: Parsable<'a>>(ctx: &mut Ctx, pair: Pair<'a, Rule>, left_rule: Option<Rule>, right_rule: Option<Rule>) -> Result<(L, R)> {
+        let relation = Self::parse(ctx, pair)?;
+        
+        fn check_bad_rule<'a>(ctx: &mut Ctx, pair: &Pair<'a, Rule>, expected: Option<Rule>) -> bool {
+            let found = pair.as_rule();
+
+            match expected {
+                Some(expected) if found == expected => {
+                    ctx.add_err(Error::UnexpectedRule { expected, found }, ctx.span_from_pair(pair));
+                    true
+                }
+                _ => false,
+            }
+        }
+
+        let mut is_bad_rule = false;
+        is_bad_rule |= check_bad_rule(ctx, &relation.left, left_rule);
+        is_bad_rule |= check_bad_rule(ctx, &relation.right, right_rule);
+
+        if is_bad_rule {
+            return Err(())
+        }
+
+        let left = L::parse(ctx, relation.left);
+        let right = R::parse(ctx, relation.right);
+
+        let left = left?;
+        let right = right?;
+
+        Ok((left, right))
+    }
+}
+
+struct RelationBlock<'a> {
+    pub kind: WithSpan<String>,
+    pub name: Option<WithSpan<String>>,
+    pub generics: Option<GenericParams>,
+    pub block: Pair<'a, Rule>,
+    pub span: Span,
+}
+
+impl<'a> Parsable<'a> for RelationBlock<'a> {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        let span = ctx.span_from_pair(&pair);
+        let inner = pair.into_inner();
+
+        let kind = parse_required_tag(ctx, &inner,
+            "kind", Error::Unexpected("Found relation block without a kind.".to_owned()), &span);
+        let args = parse_required_tag(ctx, &inner, 
+            "args", Error::Unexpected("Found relation block without args.".to_owned()), &span);
+        let block = parse_required_tag(ctx, &inner,
+            "block", Error::Unexpected("Found relation block without a block.".to_owned()), &span);
+
+        let kind = kind?;
+        let RelationBlockArgs { name, generics } = args?;
+        let block = block?;
+
+        Ok(RelationBlock {
+            kind,
+            name,
+            generics,
+            block,
+            span,
+        })
+    }
+}
+
+struct RelationBlockArgs {
+    pub name: Option<WithSpan<String>>,
+    pub generics: Option<GenericParams>,
+}
+
+impl<'a> Parsable<'a> for RelationBlockArgs {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        let inner= pair.into_inner();
+
+        let name = parse_optional_tag(ctx, &inner,
+            "name");
+        let generics = parse_optional_tag(ctx, &inner,
+            "generics");
+
+        let name = name?;
+        let generics = generics?;
+
+        Ok(Self {
+            name,
+            generics,
+        })
+    }
+}
+
+struct Block<'a> {
+    pub pairs: Vec<Pair<'a, Rule>>,
+}
+
+impl<'a> Parsable<'a> for Block<'a> {
+    fn parse(ctx: &mut Ctx, block: Pair<'a, Rule>) -> Result<Self> {
+        let pairs = block.into_inner().map(|pair| {
+            match pair.as_rule() {
+                Rule::Comma => {
+                    ctx.add_err(Error::NoCommaBlock, ctx.span_from_pair(&pair));
+                    Err(())
+                },
+                _ => Ok(pair),
+            }
+        }).collect::<Result<_>>()?;
+
+        Ok(Block {
+            pairs,
+        })
+    }
+}
+
+impl<'a> Block<'a> {
+    fn parse_into_relation_vec(ctx: &mut Ctx, block: Pair<'a, Rule>) -> Result<Vec<RelationItem<'a>>> {
+        let block = Self::parse(ctx, block)?;
+
+        let mut items = Vec::new();
+
+        fn validate_no_args<'a>(ctx: &mut Ctx, relation_block: RelationBlock<'a>) -> Result<(WithSpan<String>, Pair<'a, Rule>)> {
+            let mut has_args = false;
+            if let Some(name) = relation_block.name {
+                ctx.add_err(Error::UnexpectedName, name.span);
+                has_args = true;
+            }
+            if let Some(generics) = relation_block.generics {
+                ctx.add_err(Error::UnexpectedGenerics, generics.span);
+                has_args = true;
+            }
+            if has_args {
+                Err(())
+            } else {
+                Ok((relation_block.kind, relation_block.block))
+            }
+        }
+
+        let mut had_error = false;
+        for pair in block.pairs {
+            had_error |= match pair.as_rule() {
+                Rule::Relation => {
+                    Relation::parse_into(ctx, pair, Some(Rule::Identifier), None)
+                        .map(|(kind, value)| items.push(RelationItem::Value { kind, value }))
+                }
+                Rule::RelationBlock => RelationBlock::parse(ctx, pair)
+                    .and_then(|relation_block| validate_no_args(ctx, relation_block))
+                    .map(|(kind, block)| items.push(RelationItem::Block { kind, block })),
+                _ => {
+                    ctx.add_err(Error::Unexpected("Found non-relation item in block.".to_owned()), ctx.span_from_pair(&pair));
+                    Err(())
+                }
+            }.is_err();
+        }
+
+        if had_error {
+            Err(())
+        } else {
+            Ok(items)
+        }
+    }
+}
+
+enum RelationItem<'a> {
+    Value { kind: WithSpan<String>, value: Pair<'a, Rule> },
+    Block { kind: WithSpan<String>, block: Pair<'a, Rule> },
+}
+
+struct CommaBlock<'a> {
+    pub pairs: Vec<Pair<'a, Rule>>,
+}
+
+impl<'a> Parsable<'a> for CommaBlock<'a> {
+    fn parse(ctx: &mut Ctx, block: Pair<'a, Rule>) -> Result<Self> {
+        let mut pairs = Vec::new();
+        let mut expect_comma = false;
+
+        let mut had_error = false;
+        for pair in block.into_inner() {
+            match pair.as_rule() {
+                Rule::Comma if expect_comma => expect_comma = false,
+                Rule::Comma => {
+                    ctx.add_err(Error::UnexpectedComma, ctx.span_from_pair(&pair));
+                    had_error = true;
+                }
+                _ if !expect_comma => {
+                    pairs.push(pair);
+                    expect_comma = true;
+                }
+                _ => {
+                    ctx.add_err(Error::ExpectedComma, ctx.span_at_pair_end(&pair));
+                    had_error = true;
+                }
+            }
+        }
+
+        if had_error {
+            Err(())
+        } else {
+            Ok(CommaBlock {
+                pairs,
+            })
+        }
+    }
+}
+
+impl<'a> CommaBlock<'a> {
+    fn add_into_vec<T: Parsable<'a>>(ctx: &mut Ctx, block: Pair<'a, Rule>, vec: &mut Vec<T>) -> Result<()> {
+        let mut new = Vec::new();
+
+        let mut had_error = false;
+        for item in Self::parse(ctx, block)?.pairs {
+            had_error = T::parse(ctx, item)
+                .map(|item| new.push(item))
+                .is_err();
+        }
+
+        if had_error {
+            Err(())
+        } else {
+            Ok(vec.extend(new))
+        }
+    }
+}
+
+impl Class {
+    fn parse(ctx: &mut Ctx, relation_block: RelationBlock) -> Result<Self> {
+        let name = relation_block.name
+            .ok_or_else(|| ctx.add_err(Error::MissingNameForBlock { kind: "class".to_owned() }, relation_block.kind.span.after_end()));
+        let generics = relation_block.generics;
+        let items = Block::parse_into_relation_vec(ctx, relation_block.block);
+
+        let mut size = None;
+        let mut fields = Vec::new();
+        let mut methods = Vec::new();
+        let mut bases = Vec::new();
+        let mut static_fields = Vec::new();
+        let mut static_methods = Vec::new();
+
+        let mut had_error = false;
+        for item in items? {
+            had_error |= match item {
+                RelationItem::Value { kind, value } => match kind.as_str() {
+                    "size" => size.set_once(ctx, kind, value),
+                    _ => {
+                        ctx.add_err(Error::UnknownRelationItem { block_kind: "class".to_owned(), kind: kind.value }, kind.span);
+                        Err(())
+                    }
+                }
+                RelationItem::Block { kind, block } => match kind.as_str() {
+                    "fields" => CommaBlock::add_into_vec(ctx, block, &mut fields),
+                    "methods" => CommaBlock::add_into_vec(ctx, block, &mut methods),
+                    "bases" => CommaBlock::add_into_vec(ctx, block, &mut bases),
+                    "statics" => Block::parse_into_relation_vec(ctx, block)
+                        .and_then(|items| Globals::from_items(ctx, items))
+                        .map(|Globals { variables, functions }| {
+                            static_fields.extend(variables);
+                            static_methods.extend(functions);
+                        }),
+                    _ => {
+                        ctx.add_err(Error::UnknownRelationItem { block_kind: "class".to_owned(), kind: kind.value }, kind.span);
+                        Err(())
+                    }
+                }
+            }.is_err();
+        }
+
+        let name = name?;
+
+        if had_error {
+            Err(())
+        } else {
+            Ok(Class {
+                name,
+                generics,
+                size,
+                fields,
+                methods,
+                bases,
+                static_fields,
+                static_methods,
+                span: relation_block.span,
+            })
+        }
+    }
+}
+
+impl<'a> Parsable<'a> for Variable {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        let span = ctx.span_from_pair(&pair);
+        let (offset, binding) = Relation::parse_into(ctx, pair, Some(Rule::Integer), Some(Rule::Binding))?;
+        let Binding { name, r#type, .. } = binding;
+
+        Ok(Variable {
+            offset,
+            name,
+            r#type,
+            span,
+        })
+    }
+}
+
+
+impl<'a> Parsable<'a> for Function {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        let span= ctx.span_from_pair(&pair);
+        let (pointer, binding) = Relation::parse_into(ctx, pair, Some(Rule::Integer), Some(Rule::Binding))?;
+        let Binding { name, r#type, .. } = binding;
+
+        let Type::Function(r#type) = r#type else {
+            ctx.add_err(Error::ExpectedTypeKind { kind: "function".to_owned() }, r#type.get_span().clone());
+            return Err(())
+        };
+
+        Ok(Function {
+            pointer,
+            name,
+            r#type,
+            span,
+        })
+    }
+}
+
+impl<'a> Parsable<'a> for ClassBase {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        let span = ctx.span_from_pair(&pair);
+        let (offset, typed_block) = Relation::parse_into(ctx, pair, Some(Rule::Integer), Some(Rule::TypedBlock))?;
+        let TypedBlock { r#type, block, .. } = typed_block;
+
+        let mut vtable = None;
+        let mut overrides = Vec::new();
+        let mut virtuals = Vec::new();
+
+        let mut had_error = false;
+        for item in Block::parse_into_relation_vec(ctx, block)? {
+            had_error |= match item {
+                RelationItem::Value { kind, value } => match kind.as_str() {
+                    "vtable" => vtable.set_once(ctx, kind, value),
+                    _ => {
+                        ctx.add_err(Error::UnknownRelationItem { block_kind: "class base".to_owned(), kind: kind.value }, kind.span);
+                        Err(())
+                    }
+                },
+                RelationItem::Block { kind, block } => match kind.as_str() {
+                    "overrides" => CommaBlock::add_into_vec(ctx, block, &mut overrides),
+                    "virtuals" => CommaBlock::add_into_vec(ctx, block, &mut virtuals),
+                    _ => {
+                        ctx.add_err(Error::UnknownRelationItem { block_kind: "class base".to_owned(), kind: kind.value }, kind.span);
+                        Err(())
+                    }
+                }
+            }.is_err();
+        }
+
+        let r#type = match r#type {
+            Type::Named(named) => Ok(named),
+            _ => {
+                ctx.add_err(Error::ExpectedTypeKind { kind: "named type".to_owned() }, r#type.get_span().clone());
+                Err(())
+            }
+        };
+
+        let r#type = r#type?;
+
+        if had_error {
+            Err(())
+        } else {
+            Ok(ClassBase {
+                offset,
+                r#type,
+                vtable,
+                overrides,
+                virtuals,
+                span,
+            })
+        }
+    }
+}
+
+impl<'a> Parsable<'a> for Override {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        let span = ctx.span_from_pair(&pair);
+        let (pointer, name) = Relation::parse_into(ctx, pair, Some(Rule::Integer), Some(Rule::Identifier))?;
+
+        Ok(Override {
+            pointer,
+            name,
+            span,
+        })
+    }
+}
+
+impl<'a> Parsable<'a> for Virtual {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        let span = ctx.span_from_pair(&pair);
+        let (index, function) = Relation::parse_into(ctx, pair, Some(Rule::Integer), Some(Rule::Binding))?;
+
+        Ok(Virtual {
+            index,
+            function,
+            span,
+        })
+    }
+}
+
+struct Globals {
+    pub variables: Vec<Variable>,
+    pub functions: Vec<Function>,
+}
+
+impl Globals {
+    fn parse(ctx: &mut Ctx, relation_block: RelationBlock) -> Result<Self> {
+        let mut has_args = false;
+        if let Some(name) = relation_block.name {
+            ctx.add_err(Error::UnexpectedName, name.span);
+            has_args = true;
+        }
+        if let Some(generics) = relation_block.generics {
+            ctx.add_err(Error::UnexpectedGenerics, generics.span);
+            has_args = true;
+        }
+        if has_args {
+            Err(())
+        } else {
+            Block::parse_into_relation_vec(ctx, relation_block.block)
+                .and_then(|items| Globals::from_items(ctx, items))
+        }
+    }
+
+    fn from_items(ctx: &mut Ctx, items: Vec<RelationItem>) -> Result<Self> {
+        let mut variables = Vec::new();
+        let mut functions = Vec::new();
+
+        let mut had_error = false;
+        for item in items {
+            had_error |= match item {
+                RelationItem::Value { kind, .. } => {
+                    ctx.add_err(Error::UnknownRelationItem { block_kind: "globals".to_owned(), kind: kind.value }, kind.span);
+                    Err(())
+                }
+                RelationItem::Block { kind, block } => match kind.as_str() {
+                    "variables" => CommaBlock::add_into_vec(ctx, block, &mut variables),
+                    "functions" => CommaBlock::add_into_vec(ctx, block, &mut functions),
+                    _ => {
+                        ctx.add_err(Error::UnknownRelationItem { block_kind: "globals".to_owned(), kind: kind.value }, kind.span);
+                        Err(())
+                    }
+                }
+            }.is_err();
+        };
+
+        if had_error {
+            Err(())
+        } else {
+            Ok(Self {
+                variables,
+                functions,
+            })
+        }
+    }
+}
+
+impl Enum {
+    fn parse(ctx: &mut Ctx, relation_block: RelationBlock) -> Result<Self> {
+        let name = relation_block.name
+            .ok_or_else(|| ctx.add_err(Error::MissingNameForBlock { kind: "enum".to_owned() }, relation_block.kind.span.after_end()));
+        let no_generics = match relation_block.generics {
+            Some(generics) => {
+                ctx.add_err(Error::UnexpectedGenerics, generics.span);
+                Err(())
+            }
+            None => Ok(())
+        };
+        let items = Block::parse_into_relation_vec(ctx, relation_block.block);
+
+        let mut r#type = None;
+        let mut values = Vec::new();
+
+        let mut had_error = false;
+        for item in items? {
+            had_error |= match item {
+                RelationItem::Value { kind, value } => match kind.as_str() {
+                    "type" => r#type.set_once(ctx, kind, value),
+                    _ => {
+                        ctx.add_err(Error::UnknownRelationItem { block_kind: "enum".to_owned(), kind: kind.value }, kind.span);
+                        Err(())
+                    }
+                }
+                RelationItem::Block { kind, block } => match kind.as_str() {
+                    "values" => CommaBlock::add_into_vec(ctx, block, &mut values),
+                    _ => {
+                        ctx.add_err(Error::UnknownRelationItem { block_kind: "enum".to_owned(), kind: kind.value }, kind.span);
+                        Err(())
+                    }
+                }
+            }.is_err();
+        }
+
+        let Some(r#type) = r#type else {
+            ctx.add_err(Error::MissingEnumType, name
+                .map(|name| name.span)
+                .unwrap_or(relation_block.kind.span.after_end()));
+            return Err(());
+        };
+
+        let name = name?;
+        no_generics?;
+
+        if had_error {
+            Err(())
+        } else {
+            Ok(Self {
+                name,
+                r#type,
+                values,
+                span: relation_block.span,
+            })
+        }
+    }
+}
+
+impl<'a> Parsable<'a> for EnumValue {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        let span = ctx.span_from_pair(&pair);
+        let (value, name) = Relation::parse_into(ctx, pair, Some(Rule::Integer), Some(Rule::Identifier))?;
+
+        Ok(EnumValue {
+            value,
+            name,
+            span,
+        })
+    }
+}
+
+trait Parsable<'a> {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self>
+        where Self : Sized;
+}
+
+impl<'a, T: Parsable<'a>> Parsable<'a> for Vec<T> {
+    fn parse(ctx: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        parse_all_as(ctx, pair.into_inner())
+    }
+}
+
+impl<'a> Parsable<'a> for Pair<'a, Rule> {
+    fn parse(_: &mut Ctx, pair: Pair<'a, Rule>) -> Result<Self> {
+        Ok(pair)
+    }
+}
+
+fn parse_all_as<'a, T: Parsable<'a>>(
+    ctx: &mut Ctx,
+    pairs: Pairs<'a, Rule>,
+) -> Result<Vec<T>> {
+    pairs.map(|pair| T::parse(ctx, pair))
+        .collect()
+}
+
+fn parse_required_tag<'a, T: Parsable<'a>>(
+    ctx: &mut Ctx, 
+    pairs: &Pairs<'a, Rule>, 
+    tag: &'a str,
+    err_if_missing: Error,
+    span_if_missing: &Span,
+) -> Result<T> {
+    match pairs.find_first_tagged(tag) {
+        Some(pair) => T::parse(ctx, pair),
+        None => {
+            ctx.add_err(err_if_missing, span_if_missing.clone());
+            Err(())
+        }
+    }
+}
+
+fn parse_optional_tag<'a, T: Parsable<'a>>(
+    ctx: &mut Ctx,
+    pairs: &Pairs<'a, Rule>,
+    tag: &'a str,
+) -> Result<Option<T>> {
+    pairs.find_first_tagged(tag)
+        .map(|pair: Pair<'_, Rule>| T::parse(ctx, pair))
+        .transpose()
+}
+
+pub struct Ctx {
+    file: String,
+    errs: Vec<WithSpan<Error>>,
+}
+
+impl Ctx {
+    pub fn new(file: String) -> Self {
+        Ctx {
+            file,
+            errs: Vec::new(),
+        }
+    }
+
+    pub fn add_err(&mut self, err: Error, span: Span) {
+        self.errs.push(WithSpan { value: err, span })
+    }
+
+    pub fn convert_span<'a>(&self, span: pest::Span<'a>) -> Span {
+        Span {
+            file: self.file.clone(),
+            input: span.as_str().to_owned(),
+            start: span.start_pos().line_col(),
+            end: span.end_pos().line_col(),
+        }
+    }
+
+    pub fn span_from_linecol(&self, value: pest::error::LineColLocation) -> Span {
+        let (start, end) = match value {
+            pest::error::LineColLocation::Pos(pos) => (pos, pos),
+            pest::error::LineColLocation::Span(start, end) => (start, end),
+        };
+        Span {
+            file: self.file.clone(),
+            start,
+            end,
+            ..Default::default()
+        }
+    }
+
+    pub fn span_from_pair<'a>(&self, pair: &Pair<'a, Rule>) -> Span {
+        self.convert_span(pair.as_span())
+    }
+
+    pub fn span_at_pair_end<'a>(&self, pair: &Pair<'a, Rule>) -> Span {
+        let mut end = pair.as_span().end_pos().line_col();
+        end.1 += 1;
+        self.to_span(end)
+    }
+
+    pub fn to_span(&self, value: (usize, usize)) -> Span {
+        Span {
+            file: self.file.clone(),
+            start: value,
+            end: value,
+            ..Default::default()
+        }
+    }
+
+    pub fn span_at_start(&self) -> Span {
+        Span {
+            file: self.file.clone(),
+            ..Default::default()
+        }
+    }
+}
+
+impl ToString for Ctx {
+    fn to_string(&self) -> String {
+        let file = &self.file;
+        let mut msg = String::new();
+
+        for WithSpan { value: err, span: Span { input, start: (line, col), .. } } in &self.errs {
+            msg.push_str(&format!("error: {err}\n    at {file}:{line}:{col}\n    | {input}\n\n"));
+        }
+
+        msg
+    }
+}
+
+trait SetOnceTrait<'a> {
+    fn set_once(&mut self, ctx: &mut Ctx, kind: WithSpan<String>, value: Pair<'a, Rule>) -> Result<()>;
+}
+
+impl<'a, T: Parsable<'a>> SetOnceTrait<'a> for Option<T> {
+    fn set_once(&mut self, ctx: &mut Ctx, kind: WithSpan<String>, value: Pair<'a, Rule>) -> Result<()> {
+        if self.is_some() {
+            ctx.add_err(Error::DuplicateProperty { kind: kind.value }, kind.span);
+            Err(())
+        } else {
+            T::parse(ctx, value)
+                .map(|new_size| *self = Some(new_size))
+        }
+    }
 }

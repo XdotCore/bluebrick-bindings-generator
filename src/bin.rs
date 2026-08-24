@@ -1,8 +1,13 @@
-use bluebrick_bindings_generator::generate_bluebrick_bindings;
+mod parser;
+mod ast;
+mod error;
+mod result;
+mod typelib;
+
 use cargo_metadata::MetadataCommand;
 use serde::Deserialize;
 use structopt::StructOpt;
-use std::{error::Error, fmt::Display, path::PathBuf};
+use std::{error::Error, fmt::Display, fs, path::PathBuf};
 
 #[derive(Debug)]
 enum BinError {
@@ -65,7 +70,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let bb = metadata.bb;
     let rust = metadata.rust;
 
-    generate_bluebrick_bindings(&bb, &rust)?;
+    let ast = match parser::parse(&bb) {
+        Ok(ast) => ast,
+        Err(e) => panic!("Parser Error: {e}"),
+    };
+
+    let log_file = bb.join("log.txt");
+    fs::write(log_file, format!("{ast:#?}"))?;
 
     Ok(())
 }
