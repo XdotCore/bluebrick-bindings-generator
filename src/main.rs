@@ -3,9 +3,9 @@ mod parsers;
 use std::fs;
 
 use ariadne::{Label, Report, ReportKind, Source};
-use chumsky::prelude::*;
+use chumsky::Parser;
 
-use crate::parsers::lexer;
+use crate::parsers::lexer::{self, lexer};
 
 fn main() {
     let file_name = std::env::args().nth(1).unwrap();
@@ -17,6 +17,10 @@ fn main() {
 
     println!("Errors:");
     for error in errors {
+        if lexer::try_print_err(&file_name, Source::from(src.clone()), &error) {
+            continue;
+        }
+
         Report::build(ReportKind::Error, (file_name.clone(), error.span().into_range()))
             .with_label(Label::new((file_name.clone(), error.span().into_range())))
             .with_message(error.to_string())
